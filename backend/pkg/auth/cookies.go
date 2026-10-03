@@ -133,7 +133,12 @@ func GetTokenFromCookie(r *http.Request, cluster string) (string, error) {
 		return token.String(), nil
 	}
 
-	return "", nil
+	// No per-cluster cookie. The cluster may instead be enrolled in a fleet,
+	// where one shared cookie holds the token for every cluster trusting the
+	// same OIDC identity; see fleetcookie.go. Per-cluster cookies are read
+	// first so that a cluster which has both keeps its own token, which is what
+	// makes fleet enrollment safe to roll out over existing sessions.
+	return GetTokenFromFleetCookie(r, cluster)
 }
 
 // ClearTokenCookie clears an authentication cookie for a specific cluster.

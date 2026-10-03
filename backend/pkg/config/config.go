@@ -84,6 +84,7 @@ type Config struct {
 	OidcUseAccessToken           bool   `koanf:"oidc-use-access-token"`
 	OidcUseCookie                bool   `koanf:"oidc-use-cookie"`
 	OidcUseTokenBroadcast        bool   `koanf:"oidc-use-token-broadcast"`
+	OidcSharedTokenCookie        bool   `koanf:"oidc-shared-token-cookie"`
 	OidcSkipTLSVerify            bool   `koanf:"oidc-skip-tls-verify"`
 	OidcCAFile                   string `koanf:"oidc-ca-file"`
 	MeUsernamePath               string `koanf:"me-username-path"`
@@ -670,6 +671,11 @@ func addOIDCFlags(f *flag.FlagSet) {
 		"After a successful OIDC login or token refresh, also set the auth cookie for other "+
 			"kubeconfig contexts whose OIDC auth-provider has the same idp-issuer-url and "+
 			"client-id. Disabled by default. Preconditions and caveats: "+
+			"https://headlamp.dev/docs/latest/installation/in-cluster/oidc/")
+	f.Bool("oidc-shared-token-cookie", false,
+		"With --oidc-use-token-broadcast, store the token once in a cookie shared by all "+
+			"matching clusters, rather than a copy per cluster, and cover clusters added after "+
+			"login. Disabled by default. Details: "+
 			"https://headlamp.dev/docs/latest/installation/in-cluster/oidc/")
 	f.Bool("oidc-use-pkce", false, "Use PKCE (Proof Key for Code Exchange) for enhanced security in OIDC flow")
 	f.String("me-username-path", DefaultMeUsernamePath,

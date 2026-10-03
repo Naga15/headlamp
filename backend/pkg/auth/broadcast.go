@@ -38,6 +38,10 @@ type BroadcastOIDCTokenParams struct {
 	Token           string
 	BaseURL         string
 	SessionTTL      int
+	// UseFleetCookie stores the token once in a shared fleet cookie and gives
+	// each matching cluster a small pointer at it, instead of writing a full
+	// copy of the token per cluster. See fleetcookie.go.
+	UseFleetCookie bool
 }
 
 // isOIDCAuthContext reports whether the kubeconfig context's auth-provider is
@@ -112,6 +116,21 @@ func BroadcastOIDCToken(params BroadcastOIDCTokenParams) {
 			"failed to get contexts for broadcasting OIDC token")
 
 		return
+	}
+
+	// In fleet mode the token is stored once, before the loop, and each matching
+	// cluster below is given only a pointer at it. The source cluster is
+	// enrolled too, so that a later refresh updating the shared cookie updates
+	// the source along with everyone else rather than leaving it behind on a
+	// per-cluster cookie.
+	if params.UseFleetCookie {
+		fleetKey := FleetCookieKey(sourceOIDCConfig.IdpIssuerURL, sourceOIDCConfig.ClientID)
+		if fleetKey == "" {
+			return
+		}
+
+		SetFleetTokenCookie(params.Writer, params.Request, fleetKey, params.Token, params.BaseURL, params.SessionTTL)
+		enrollInFleet(params, params.SourceCluster, fleetKey)
 	}
 
 	for _, kCtx := range kContexts {
@@ -235,8 +254,30 @@ func broadcastToTarget(
 		return
 	}
 
-	SetTokenCookie(params.Writer, params.Request, kCtx.Name, params.Token, params.BaseURL, params.SessionTTL)
+	if params.UseFleetCookie {
+		enrollInFleet(params, kCtx.Name, FleetCookieKey(issuer, clientID))
+	} else {
+		SetTokenCookie(params.Writer, params.Request, kCtx.Name, params.Token, params.BaseURL, params.SessionTTL)
+	}
+
 	logger.Log(logger.LevelInfo,
 		map[string]string{logFieldSourceCluster: params.SourceCluster, logFieldTargetCluster: kCtx.Name},
 		nil, "broadcasted OIDC token to cluster")
+}
+
+// enrollInFleet points one cluster at the shared token cookie and drops any
+// per-cluster token cookie it still holds.
+//
+// Clearing matters because GetTokenFromCookie reads the per-cluster cookie
+// first. Leaving one in place would shadow the shared cookie for that cluster
+// and freeze it on whichever token it last received directly, which is exactly
+// the per-cluster drift fleet mode exists to remove. Clearing it leaves the
+// shared cookie as the single source of truth for every enrolled cluster.
+func enrollInFleet(params BroadcastOIDCTokenParams, cluster, fleetKey string) {
+	if fleetKey == "" {
+		return
+	}
+
+	clearTokenCookieChunksBlind(params.Writer, params.Request, cluster, params.BaseURL)
+	SetFleetRefCookie(params.Writer, params.Request, cluster, fleetKey, params.BaseURL, params.SessionTTL)
 }

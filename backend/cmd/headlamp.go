@@ -1253,6 +1253,7 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 				Token:           rawUserToken,
 				BaseURL:         config.BaseURL,
 				SessionTTL:      config.SessionTTL,
+				UseFleetCookie:  config.OidcSharedTokenCookie,
 			})
 		}
 
@@ -1408,6 +1409,7 @@ func (c *HeadlampConfig) OIDCTokenRefreshMiddleware(next http.Handler) http.Hand
 		Metrics:                      c.Metrics,
 		OidcUseAccessToken:           c.OidcUseAccessToken,
 		OidcUseTokenBroadcast:        c.OidcUseTokenBroadcast,
+		OidcSharedTokenCookie:        c.OidcSharedTokenCookie,
 		OidcIdpIssuerURL:             c.OidcIdpIssuerURL,
 		OidcValidatorIdpIssuerURL:    c.OidcValidatorIdpIssuerURL,
 		BaseURL:                      c.BaseURL,

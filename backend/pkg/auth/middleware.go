@@ -42,6 +42,7 @@ type OIDCTokenRefreshConfig struct {
 	Metrics                      *telemetry.Metrics
 	OidcUseAccessToken           bool
 	OidcUseTokenBroadcast        bool
+	OidcSharedTokenCookie        bool
 	OidcIdpIssuerURL             string
 	OidcValidatorIdpIssuerURL    string
 	BaseURL                      string
@@ -98,6 +99,11 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 			}
 
 			cluster, token := ParseClusterAndToken(r)
+
+			if token == "" {
+				token = config.enrollClusterInFleet(w, r, cluster)
+			}
+
 			if config.shouldBypassOIDCRefresh(cluster, token, w, r, span, &status, next) {
 				return
 			}
@@ -149,11 +155,62 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 				SessionTTL:                config.SessionTTL,
 				KubeConfigStore:           config.KubeConfigStore,
 				UseTokenBroadcast:         config.OidcUseTokenBroadcast,
+				UseFleetCookie:            config.OidcSharedTokenCookie,
 			})
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// enrollClusterInFleet admits a cluster to an in-progress fleet session.
+//
+// A cluster that was not in the kubeconfig when the user logged in never
+// received a broadcast, so it holds no cookie and would otherwise prompt for a
+// fresh login even though the fleet it belongs to is already authenticated.
+// This covers that case: when the request carries a shared token cookie for the
+// OIDC identity this cluster's own kubeconfig context names, the cluster is
+// entitled to it, so it is given a ref cookie for subsequent requests and the
+// token is returned for this one.
+//
+// Reading the cluster's issuer and client-id from the store is what authorizes
+// the read. It is the same check broadcastToTarget applies at login time, moved
+// to first contact, so a cluster can only ever reach a shared cookie belonging
+// to an identity it already trusts. Returns "" whenever that cannot be
+// established, leaving the caller on the normal unauthenticated path.
+func (c *OIDCTokenRefreshConfig) enrollClusterInFleet(
+	w http.ResponseWriter, r *http.Request, cluster string,
+) string {
+	if !c.OidcUseTokenBroadcast || !c.OidcSharedTokenCookie || cluster == "" {
+		return ""
+	}
+
+	kContext, err := c.KubeConfigStore.GetContext(cluster)
+	if err != nil || kContext == nil {
+		return ""
+	}
+
+	// Internal contexts are per-user stateless clusters whose store keys embed a
+	// NUL-separated user ID that SanitizeClusterName collapses, so they are
+	// excluded here for the same reason BroadcastOIDCToken excludes them.
+	if kContext.Internal || !isOIDCAuthContext(kContext) {
+		return ""
+	}
+
+	fleetKey := FleetCookieKey(oidcIssuerAndClientID(kContext))
+
+	token := fleetTokenByKey(r, fleetKey)
+	if token == "" {
+		return ""
+	}
+
+	SetFleetRefCookie(w, r, cluster, fleetKey, c.BaseURL, c.SessionTTL)
+	r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	logger.Log(logger.LevelInfo, map[string]string{"cluster": cluster}, nil,
+		"enrolled cluster in existing OIDC fleet session")
+
+	return token
 }
 
 // shouldUseUnsafeServiceAccountToken reports whether the config is running

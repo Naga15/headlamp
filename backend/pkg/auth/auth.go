@@ -603,6 +603,7 @@ type RefreshAndSetTokenParams struct {
 	SessionTTL                int
 	KubeConfigStore           kubeconfig.ContextStore
 	UseTokenBroadcast         bool
+	UseFleetCookie            bool
 }
 
 // RefreshAndSetToken refreshes an expiring token, updates the auth cookie,
@@ -686,5 +687,6 @@ func broadcastRefreshedToken(params RefreshAndSetTokenParams, newTokenString str
 		Token:           newTokenString,
 		BaseURL:         params.BaseURL,
 		SessionTTL:      params.SessionTTL,
+		UseFleetCookie:  params.UseFleetCookie,
 	})
 }

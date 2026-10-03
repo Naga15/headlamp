@@ -49,6 +49,9 @@ const (
 
 const JWTExpirationTTL = 10 * time.Second // seconds
 
+// errFieldMessage is the JSON field name used by writeMeJSON for error messages.
+const errFieldMessage = "message"
+
 // DecodeBase64JSON decodes a base64 URL-encoded JSON string into a map.
 func DecodeBase64JSON(base64JSON string) (map[string]interface{}, error) {
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(base64JSON)
@@ -189,7 +192,7 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 	// get refresh token
 	refreshToken, err := cache.Get(ctx, oidcKeyPrefix+token)
 	if err != nil {
-		return nil, fmt.Errorf("getting refresh token: %v", err)
+		return nil, fmt.Errorf("getting refresh token: %w", err)
 	}
 
 	rToken, ok := refreshToken.(string)
@@ -214,7 +217,7 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 
 	// update the refresh token in the cache
 	if err := CacheRefreshedToken(newToken, tokenType, token, rToken, cache); err != nil {
-		return nil, fmt.Errorf("caching refreshed token: %v", err)
+		return nil, fmt.Errorf("caching refreshed token: %w", err)
 	}
 
 	return newToken, nil
@@ -350,7 +353,7 @@ func HandleMe(opts MeHandlerOptions) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		clusterName := mux.Vars(r)["clusterName"]
 		if clusterName == "" {
-			writeMeJSON(w, http.StatusBadRequest, map[string]interface{}{"message": "cluster not specified"})
+			writeMeJSON(w, http.StatusBadRequest, map[string]interface{}{errFieldMessage: "cluster not specified"})
 			return
 		}
 
@@ -365,23 +368,23 @@ func HandleMe(opts MeHandlerOptions) http.HandlerFunc {
 		}
 
 		if requestCluster != clusterName {
-			writeMeJSON(w, http.StatusBadRequest, map[string]interface{}{"message": "cluster mismatch"})
+			writeMeJSON(w, http.StatusBadRequest, map[string]interface{}{errFieldMessage: "cluster mismatch"})
 			return
 		}
 
 		if token == "" {
-			writeMeJSON(w, http.StatusUnauthorized, map[string]interface{}{"message": "unauthorized"})
+			writeMeJSON(w, http.StatusUnauthorized, map[string]interface{}{errFieldMessage: "unauthorized"})
 			return
 		}
 
 		claims, status, errMsg := parseClaimsFromToken(token)
 		if status != 0 {
-			writeMeJSON(w, status, map[string]interface{}{"message": errMsg})
+			writeMeJSON(w, status, map[string]interface{}{errFieldMessage: errMsg})
 			return
 		}
 
 		if expiry, err := GetExpiryUnixTimeUTC(claims); err != nil || time.Now().After(expiry) {
-			writeMeJSON(w, http.StatusUnauthorized, map[string]interface{}{"message": "token expired"})
+			writeMeJSON(w, http.StatusUnauthorized, map[string]interface{}{errFieldMessage: "token expired"})
 			return
 		}
 
@@ -576,6 +579,13 @@ func marshalToString(val interface{}) (string, bool) {
 
 // RefreshAndSetTokenParams groups the inputs required to refresh a token and
 // update the Headlamp auth cookie.
+//
+// KubeConfigStore and UseTokenBroadcast are optional: when UseTokenBroadcast is
+// true and KubeConfigStore is non-nil, a successfully refreshed token is also
+// broadcast to sibling kubeconfig contexts sharing the source cluster's OIDC
+// issuer + client-id (see BroadcastOIDCToken), so sibling cookies stay in sync
+// across refresh cycles. Leaving them zero preserves the previous behavior of
+// refreshing only the requesting cluster's cookie.
 type RefreshAndSetTokenParams struct {
 	Ctx                       context.Context
 	OIDCAuthConfig            *kubeconfig.OidcConfig
@@ -591,10 +601,15 @@ type RefreshAndSetTokenParams struct {
 	OIDCValidatorIdpIssuerURL string
 	BaseURL                   string
 	SessionTTL                int
+	KubeConfigStore           kubeconfig.ContextStore
+	UseTokenBroadcast         bool
+	UseFleetCookie            bool
 }
 
 // RefreshAndSetToken refreshes an expiring token, updates the auth cookie,
-// and records telemetry based on the provided parameters.
+// and records telemetry based on the provided parameters. When token broadcast
+// is enabled via the params, the refreshed token is additionally broadcast to
+// sibling contexts sharing the same OIDC issuer + client-id.
 func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 	// The token type to use
 	tokenType := "id_token"
@@ -621,29 +636,57 @@ func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 			err, "failed to refresh token")
 		params.TelemetryHandler.RecordError(params.Span, err, "Token refresh failed")
 		params.TelemetryHandler.RecordErrorCount(params.Ctx, attribute.String("error", "token_refresh_failure"))
-	} else if newToken != nil {
-		var newTokenString string
 
-		var ok bool
-
-		if params.OIDCUseAccessToken {
-			newTokenString, ok = newToken.Extra("access_token").(string)
-		} else {
-			newTokenString, ok = newToken.Extra("id_token").(string)
-		}
-
-		if !ok || newTokenString == "" {
-			logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
-				errors.New("refreshed token missing expected field"), "failed to extract token string")
-			params.TelemetryHandler.RecordError(params.Span,
-				errors.New("refreshed token missing expected field"), "Token extraction failed")
-
-			return
-		}
-
-		// Set refreshed token in cookie
-		SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
-
-		params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
+		return
 	}
+
+	if newToken == nil {
+		return
+	}
+
+	var newTokenString string
+
+	var ok bool
+
+	if params.OIDCUseAccessToken {
+		newTokenString, ok = newToken.Extra("access_token").(string)
+	} else {
+		newTokenString, ok = newToken.Extra("id_token").(string)
+	}
+
+	if !ok || newTokenString == "" {
+		logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
+			errors.New("refreshed token missing expected field"), "failed to extract token string")
+		params.TelemetryHandler.RecordError(params.Span,
+			errors.New("refreshed token missing expected field"), "Token extraction failed")
+
+		return
+	}
+
+	// Set refreshed token in cookie
+	SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
+
+	params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
+
+	broadcastRefreshedToken(params, newTokenString)
+}
+
+// broadcastRefreshedToken keeps sibling clusters in sync with a freshly
+// refreshed token so they do not fall back to per-cluster re-login once the
+// old token expires. No-op unless broadcasting is enabled on the params.
+func broadcastRefreshedToken(params RefreshAndSetTokenParams, newTokenString string) {
+	if !params.UseTokenBroadcast || params.KubeConfigStore == nil {
+		return
+	}
+
+	BroadcastOIDCToken(BroadcastOIDCTokenParams{
+		Writer:          params.Writer,
+		Request:         params.Request,
+		KubeConfigStore: params.KubeConfigStore,
+		SourceCluster:   params.Cluster,
+		Token:           newTokenString,
+		BaseURL:         params.BaseURL,
+		SessionTTL:      params.SessionTTL,
+		UseFleetCookie:  params.UseFleetCookie,
+	})
 }

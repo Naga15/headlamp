@@ -16,9 +16,9 @@
 
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
-import Chip from '@mui/material/Chip';
+import Chip, { ChipProps } from '@mui/material/Chip';
 import Link from '@mui/material/Link';
-import { useTheme } from '@mui/material/styles';
+import { SxProps, Theme, useTheme } from '@mui/material/styles';
 import { SwitchProps } from '@mui/material/Switch';
 import Switch from '@mui/material/Switch';
 import Tooltip from '@mui/material/Tooltip';
@@ -30,6 +30,7 @@ import { useDispatch } from 'react-redux';
 import { isElectron } from '../../../helpers/isElectron';
 import { useFilterFunc } from '../../../lib/util';
 import { PluginInfo, reloadPage, setPluginSettings } from '../../../plugin/pluginsSlice';
+import { HeadlampEventType, useEventCallback } from '../../../redux/headlampEventSlice';
 import { useTypedSelector } from '../../../redux/hooks';
 import { Link as HeadlampLink } from '../../common/';
 import ActionButton from '../../common/ActionButton';
@@ -52,6 +53,9 @@ export interface PluginSettingsPureProps {
   onSave: (plugins: PluginInfo[]) => void;
   onDelete?: (plugin: PluginInfo) => Promise<void> | void;
   saveAlwaysEnable?: boolean;
+  showDevelopmentPluginsSetting?: boolean;
+  developmentPluginsEnabled?: boolean;
+  onDevelopmentPluginsChange?: (enabled: boolean) => void;
 }
 
 /** PluginSettingsProp intentially left empty to remain malleable */
@@ -142,7 +146,8 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
         displayName: name ?? plugin.name,
         origin: plugin.origin ?? author?.substring(1) ?? t('translation|Unknown'),
         // If the plugin is not loaded, ensure it's disabled
-        isEnabled: plugin.isLoaded === false ? false : plugin.isEnabled,
+        isEnabled:
+          plugin.isLoaded === false && !plugin.isDevelopmentModeBlocked ? false : plugin.isEnabled,
       };
     })
   );
@@ -244,6 +249,42 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
 
   return (
     <>
+      {props.showDevelopmentPluginsSetting && (
+        <SectionBox title={t('translation|Plugin Development Mode')}>
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              alignItems: 'center',
+              gap: 2,
+            }}
+          >
+            <Box>
+              <Typography id="development-plugins-label">
+                {t('translation|Load development plugins')}
+              </Typography>
+              <Typography
+                id="development-plugins-description"
+                variant="body2"
+                color="text.secondary"
+              >
+                {t(
+                  'translation|Load plugins from your local development directory. Only enable this when you trust every plugin in that directory.'
+                )}
+              </Typography>
+            </Box>
+            <Switch
+              color="primary"
+              checked={props.developmentPluginsEnabled === true}
+              onChange={event => props.onDevelopmentPluginsChange?.(event.target.checked)}
+              inputProps={{
+                'aria-labelledby': 'development-plugins-label',
+                'aria-describedby': 'development-plugins-description',
+              }}
+            />
+          </Box>
+        </SectionBox>
+      )}
       <SectionBox
         title={<SectionFilterHeader title={t('translation|Plugins')} noNamespaceFilter />}
       >
@@ -298,7 +339,10 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
               header: t('translation|Type'),
               accessorFn: (plugin: PluginInfo) => plugin.type || 'unknown',
               Cell: ({ row: { original: plugin } }: { row: MRT_Row<PluginInfo> }) => {
-                const typeLabels: Record<string, { label: string; color: any }> = {
+                const typeLabels: Record<
+                  string,
+                  { label: string; color: ChipProps['color']; sx?: SxProps<Theme> }
+                > = {
                   development: {
                     label: t('translation|Development'),
                     color: 'primary',
@@ -306,6 +350,13 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
                   user: {
                     label: t('translation|User-installed'),
                     color: 'info',
+                    // info.main is a light blue whose default white text only
+                    // reaches 3.85:1. Use dark text so the chip meets the WCAG
+                    // AA 4.5:1 minimum (5.44:1 on light, 9.1:1 on dark themes).
+                    sx: (theme: Theme) => ({
+                      backgroundColor: theme.palette.info.main,
+                      color: theme.palette.common.black,
+                    }),
                   },
                   shipped: {
                     label: t('translation|Shipped'),
@@ -313,7 +364,14 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
                   },
                 };
                 const typeInfo = typeLabels[plugin.type || 'shipped'];
-                return <Chip label={typeInfo.label} size="small" color={typeInfo.color} />;
+                return (
+                  <Chip
+                    label={typeInfo.label}
+                    size="small"
+                    color={typeInfo.color}
+                    sx={typeInfo.sx}
+                  />
+                );
               },
             },
             {
@@ -334,6 +392,26 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
             {
               header: t('translation|Status'),
               Cell: ({ row: { original: plugin } }: { row: MRT_Row<PluginInfo> }) => {
+                if (plugin.isDevelopmentModeBlocked) {
+                  return (
+                    <Tooltip
+                      title={t('translation|Enable Plugin Development Mode to load this plugin')}
+                    >
+                      <Chip
+                        label={t('translation|Not Loaded')}
+                        role="note"
+                        tabIndex={0}
+                        aria-label={`${t('translation|Not Loaded')}. ${t(
+                          'translation|Enable Plugin Development Mode to load this plugin'
+                        )}`}
+                        size="small"
+                        color="warning"
+                        variant="outlined"
+                      />
+                    </Tooltip>
+                  );
+                }
+
                 if (plugin.isCompatible === false) {
                   return (
                     <Tooltip
@@ -389,7 +467,7 @@ export function PluginSettingsPure(props: PluginSettingsPureProps) {
               header: t('translation|Enable'),
               accessorFn: (plugin: PluginInfo) => plugin.isEnabled,
               Cell: ({ row: { original: plugin } }: { row: MRT_Row<PluginInfo> }) => {
-                if (!plugin.isCompatible || !isElectron()) {
+                if (plugin.isDevelopmentModeBlocked || !plugin.isCompatible || !isElectron()) {
                   return null;
                 }
 
@@ -493,10 +571,37 @@ export default function PluginSettings() {
   const dispatch = useDispatch();
   const pluginSettings = useTypedSelector(state => state.plugins.pluginSettings);
   const handleDelete = usePluginDelete();
+  const dispatchHeadlampEvent = useEventCallback(HeadlampEventType.PLUGIN_LIST_VIEW);
+  const showDevelopmentPluginsSetting = isElectron() && window.desktopApi?.isDevelopment !== true;
+  const [developmentPluginsEnabled, setDevelopmentPluginsEnabled] = useState(false);
+
+  useEffect(() => {
+    dispatchHeadlampEvent({ plugins: pluginSettings });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pluginSettings]);
+
+  useEffect(() => {
+    if (!showDevelopmentPluginsSetting) {
+      return;
+    }
+
+    const unsubscribe = window.desktopApi?.receive(
+      'development-plugins',
+      setDevelopmentPluginsEnabled
+    );
+    window.desktopApi?.send('request-development-plugins');
+    return unsubscribe;
+  }, [showDevelopmentPluginsSetting]);
 
   return (
     <PluginSettingsPure
       plugins={pluginSettings}
+      showDevelopmentPluginsSetting={showDevelopmentPluginsSetting}
+      developmentPluginsEnabled={developmentPluginsEnabled}
+      onDevelopmentPluginsChange={enabled => {
+        setDevelopmentPluginsEnabled(enabled);
+        window.desktopApi?.send('set-development-plugins', enabled);
+      }}
       onSave={plugins => {
         dispatch(setPluginSettings(plugins));
         dispatch(reloadPage());

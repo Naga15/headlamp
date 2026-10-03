@@ -14,13 +14,31 @@
  * limitations under the License.
  */
 
+import { configureStore } from '@reduxjs/toolkit';
 import { Meta, StoryFn } from '@storybook/react';
 import { delay, http, HttpResponse } from 'msw';
-import { Provider } from 'react-redux';
-import { MemoryRouter } from 'react-router-dom';
-import store from '../../redux/stores/store';
-import { TestContext } from '../../test';
+import { expect, within } from 'storybook/test';
+import { pluginsLoaded } from '../../plugin/pluginsSlice';
+import reducers from '../../redux/reducers/reducers';
+import { API_BASE, TestContext } from '../../test';
 import Layout from './Layout';
+import { applyBackendThemeConfig } from './themeSlice';
+
+function createLayoutStore(themeConfigReady = true) {
+  const store = configureStore({ reducer: reducers });
+  store.dispatch(pluginsLoaded());
+  if (themeConfigReady) {
+    store.dispatch(applyBackendThemeConfig({}));
+  }
+  return store;
+}
+
+const clusterRequestHandlers = [
+  http.get(`${API_BASE}/clusters/:cluster/*`, () =>
+    HttpResponse.json({ kind: 'List', items: [], metadata: {} })
+  ),
+  http.post(`${API_BASE}/clusters/:cluster/*`, () => HttpResponse.json({ status: {} })),
+];
 
 export default {
   title: 'App/Layout',
@@ -36,7 +54,7 @@ export default {
     msw: {
       handlers: [
         // Mock cluster config
-        http.get('http://localhost:4466/config', () =>
+        http.get(`${API_BASE}/config`, () =>
           HttpResponse.json({
             clusters: {
               minikube: {
@@ -51,9 +69,9 @@ export default {
           })
         ),
         // Mock plugins
-        http.get('http://localhost:4466/plugins', () => HttpResponse.json([])),
+        http.get(`${API_BASE}/plugins`, () => HttpResponse.json([])),
         // Mock cluster version
-        http.get('http://localhost:4466/version', () =>
+        http.get(`${API_BASE}/version`, () =>
           HttpResponse.json({
             major: '1',
             minor: '28',
@@ -61,14 +79,14 @@ export default {
           })
         ),
         // Mock events
-        http.get('http://localhost:4466/*/api/v1/events', () =>
+        http.get(`${API_BASE}/*/api/v1/events`, () =>
           HttpResponse.json({
             kind: 'EventList',
             items: [],
           })
         ),
         // Mock namespaces
-        http.get('http://localhost:4466/*/api/v1/namespaces', () =>
+        http.get(`${API_BASE}/*/api/v1/namespaces`, () =>
           HttpResponse.json({
             kind: 'NamespaceList',
             items: [
@@ -81,36 +99,29 @@ export default {
           })
         ),
         // Mock CRDs
-        http.get(
-          'http://localhost:4466/apis/apiextensions.k8s.io/v1/customresourcedefinitions',
-          () =>
-            HttpResponse.json({
-              kind: 'List',
-              items: [],
-              metadata: {},
-            })
+        http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1/customresourcedefinitions`, () =>
+          HttpResponse.json({
+            kind: 'List',
+            items: [],
+            metadata: {},
+          })
         ),
-        http.get(
-          'http://localhost:4466/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions',
-          () =>
-            HttpResponse.json({
-              kind: 'List',
-              items: [],
-              metadata: {},
-            })
+        http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions`, () =>
+          HttpResponse.json({
+            kind: 'List',
+            items: [],
+            metadata: {},
+          })
         ),
+        ...clusterRequestHandlers,
       ],
     },
   },
   decorators: [
     Story => (
-      <Provider store={store}>
-        <MemoryRouter initialEntries={['/']}>
-          <TestContext>
-            <Story />
-          </TestContext>
-        </MemoryRouter>
-      </Provider>
+      <TestContext store={createLayoutStore()}>
+        <Story />
+      </TestContext>
     ),
   ],
 } as Meta<typeof Layout>;
@@ -129,13 +140,13 @@ Default.parameters = {
 export const WithClusterRoute = Template.bind({});
 WithClusterRoute.decorators = [
   Story => (
-    <Provider store={store}>
-      <MemoryRouter initialEntries={['/c/minikube/pods']}>
-        <TestContext routerMap={{ cluster: 'minikube' }}>
-          <Story />
-        </TestContext>
-      </MemoryRouter>
-    </Provider>
+    <TestContext
+      store={createLayoutStore()}
+      routerMap={{ cluster: 'minikube', resource: 'pods' }}
+      urlPrefix="/c"
+    >
+      <Story />
+    </TestContext>
   ),
 ];
 WithClusterRoute.parameters = {
@@ -147,6 +158,17 @@ WithClusterRoute.parameters = {
 };
 
 export const LoadingState = Template.bind({});
+LoadingState.decorators = [
+  Story => (
+    <TestContext store={createLayoutStore(false)}>
+      <Story />
+    </TestContext>
+  ),
+];
+LoadingState.play = async ({ canvasElement }) => {
+  const loader = within(canvasElement).getByRole('progressbar', { name: 'Loading' });
+  await expect(loader).toHaveClass('MuiCircularProgress-colorInherit');
+};
 LoadingState.parameters = {
   docs: {
     description: {
@@ -159,7 +181,7 @@ LoadingState.parameters = {
   msw: {
     handlers: [
       // Delay config response to show loading for 5 seconds
-      http.get('http://localhost:4466/config', async () => {
+      http.get(`${API_BASE}/config`, async () => {
         await delay(5000);
         return HttpResponse.json({
           clusters: {
@@ -170,53 +192,20 @@ LoadingState.parameters = {
           },
         });
       }),
-      http.get('http://localhost:4466/plugins', () => HttpResponse.json([])),
-      http.get('http://localhost:4466/apis/apiextensions.k8s.io/v1/customresourcedefinitions', () =>
+      http.get(`${API_BASE}/plugins`, () => HttpResponse.json([])),
+      http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1/customresourcedefinitions`, () =>
         HttpResponse.json({
           kind: 'List',
           items: [],
           metadata: {},
         })
       ),
-      http.get(
-        'http://localhost:4466/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions',
-        () =>
-          HttpResponse.json({
-            kind: 'List',
-            items: [],
-            metadata: {},
-          })
-      ),
-    ],
-  },
-};
-
-export const ErrorState = Template.bind({});
-ErrorState.parameters = {
-  docs: {
-    description: {
-      story: 'Layout showing error state when cluster configuration fails to load.',
-    },
-  },
-  msw: {
-    handlers: [
-      http.get('http://localhost:4466/config', () => HttpResponse.error()),
-      http.get('http://localhost:4466/plugins', () => HttpResponse.json([])),
-      http.get('http://localhost:4466/apis/apiextensions.k8s.io/v1/customresourcedefinitions', () =>
+      http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions`, () =>
         HttpResponse.json({
           kind: 'List',
           items: [],
           metadata: {},
         })
-      ),
-      http.get(
-        'http://localhost:4466/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions',
-        () =>
-          HttpResponse.json({
-            kind: 'List',
-            items: [],
-            metadata: {},
-          })
       ),
     ],
   },
@@ -225,13 +214,13 @@ ErrorState.parameters = {
 export const MultiCluster = Template.bind({});
 MultiCluster.decorators = [
   Story => (
-    <Provider store={store}>
-      <MemoryRouter initialEntries={['/c/minikube+production/pods']}>
-        <TestContext routerMap={{ cluster: 'minikube+production' }}>
-          <Story />
-        </TestContext>
-      </MemoryRouter>
-    </Provider>
+    <TestContext
+      store={createLayoutStore()}
+      routerMap={{ cluster: 'minikube+production', resource: 'pods' }}
+      urlPrefix="/c"
+    >
+      <Story />
+    </TestContext>
   ),
 ];
 MultiCluster.parameters = {
@@ -242,7 +231,8 @@ MultiCluster.parameters = {
   },
   msw: {
     handlers: [
-      http.get('http://localhost:4466/config', () =>
+      ...clusterRequestHandlers,
+      http.get(`${API_BASE}/config`, () =>
         HttpResponse.json({
           clusters: {
             minikube: {
@@ -260,22 +250,20 @@ MultiCluster.parameters = {
           },
         })
       ),
-      http.get('http://localhost:4466/plugins', () => HttpResponse.json([])),
-      http.get('http://localhost:4466/apis/apiextensions.k8s.io/v1/customresourcedefinitions', () =>
+      http.get(`${API_BASE}/plugins`, () => HttpResponse.json([])),
+      http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1/customresourcedefinitions`, () =>
         HttpResponse.json({
           kind: 'List',
           items: [],
           metadata: {},
         })
       ),
-      http.get(
-        'http://localhost:4466/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions',
-        () =>
-          HttpResponse.json({
-            kind: 'List',
-            items: [],
-            metadata: {},
-          })
+      http.get(`${API_BASE}/apis/apiextensions.k8s.io/v1beta1/customresourcedefinitions`, () =>
+        HttpResponse.json({
+          kind: 'List',
+          items: [],
+          metadata: {},
+        })
       ),
     ],
   },

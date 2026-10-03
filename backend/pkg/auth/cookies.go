@@ -94,7 +94,9 @@ func SetTokenCookie(w http.ResponseWriter, r *http.Request, cluster, token, base
 	// if token is larger than maxCookieSize, split it into multiple cookies
 	chunks := splitToken(token, chunkSize)
 	for i, chunk := range chunks {
-		cookie := &http.Cookie{
+		// G124: Secure is set from IsSecureContext so localhost development still works;
+		// HttpOnly and SameSite are set unconditionally.
+		cookie := &http.Cookie{ //nolint:gosec
 			Name:     fmt.Sprintf("headlamp-auth-%s.%d", sanitizedCluster, i),
 			Value:    chunk,
 			HttpOnly: true,
@@ -131,7 +133,12 @@ func GetTokenFromCookie(r *http.Request, cluster string) (string, error) {
 		return token.String(), nil
 	}
 
-	return "", nil
+	// No per-cluster cookie. The cluster may instead be enrolled in a fleet,
+	// where one shared cookie holds the token for every cluster trusting the
+	// same OIDC identity; see fleetcookie.go. Per-cluster cookies are read
+	// first so that a cluster which has both keeps its own token, which is what
+	// makes fleet enrollment safe to roll out over existing sessions.
+	return GetTokenFromFleetCookie(r, cluster)
 }
 
 // ClearTokenCookie clears an authentication cookie for a specific cluster.
@@ -153,7 +160,9 @@ func ClearTokenCookie(w http.ResponseWriter, r *http.Request, cluster, baseURL s
 			break
 		}
 
-		cookie := &http.Cookie{
+		// G124: Secure is set from IsSecureContext so localhost development still works;
+		// HttpOnly and SameSite are set unconditionally.
+		cookie := &http.Cookie{ //nolint:gosec
 			Name:     cookieName,
 			Value:    "",
 			HttpOnly: true,

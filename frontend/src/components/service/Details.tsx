@@ -20,13 +20,14 @@ import _ from 'lodash';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
+import { labelSelectorToQuery } from '../../lib/k8s';
 import Endpoint from '../../lib/k8s/endpoints';
 import EndpointSlice from '../../lib/k8s/endpointSlices';
-import Service from '../../lib/k8s/service';
+import Service, { KubeServicePort } from '../../lib/k8s/service';
 import Empty from '../common/EmptyContent';
 import { ValueLabel } from '../common/Label';
 import Link from '../common/Link';
-import { DetailsGrid, MetadataDictGrid } from '../common/Resource';
+import { DetailsGrid, MetadataDictGrid, TargetedPodsSection } from '../common/Resource';
 import PortForward from '../common/Resource/PortForward';
 import { SectionBox } from '../common/SectionBox';
 import SimpleTable from '../common/SimpleTable';
@@ -72,8 +73,71 @@ export default function ServiceDetails(props: {
             value: item.spec.clusterIP,
           },
           {
+            name: t('Cluster IPs'),
+            value: item.spec.clusterIPs?.join(', '),
+            // Hide when redundant with the Cluster IP row above (single entry, same value).
+            hide:
+              !item.spec.clusterIPs?.length ||
+              _.isEqual(item.spec.clusterIPs, [item.spec.clusterIP]),
+          },
+          {
             name: t('External IP'),
             value: item.getExternalAddresses(),
+            hide: _.isEmpty,
+          },
+          {
+            name: t('External Name'),
+            value: item.spec.externalName,
+            hide: _.isEmpty,
+          },
+          {
+            name: t('IP Families'),
+            value: item.spec.ipFamilies?.join(', '),
+            hide: _.isEmpty,
+          },
+          {
+            name: t('IP Family Policy'),
+            value: item.spec.ipFamilyPolicy,
+            hide: _.isEmpty,
+          },
+          {
+            name: t('Session Affinity'),
+            value:
+              item.spec.sessionAffinity === 'ClientIP' &&
+              item.spec.sessionAffinityConfig?.clientIP?.timeoutSeconds
+                ? `${item.spec.sessionAffinity} (${item.spec.sessionAffinityConfig.clientIP.timeoutSeconds}s)`
+                : item.spec.sessionAffinity,
+            // Match kubectl describe: skip the row for the default 'None' affinity.
+            hide: !item.spec.sessionAffinity || item.spec.sessionAffinity === 'None',
+          },
+          {
+            name: t('External Traffic Policy'),
+            value: item.spec.externalTrafficPolicy,
+            hide: _.isEmpty,
+          },
+          {
+            name: t('Internal Traffic Policy'),
+            value: item.spec.internalTrafficPolicy,
+            hide: _.isEmpty,
+          },
+          {
+            name: t('Health Check Node Port'),
+            value: item.spec.healthCheckNodePort,
+            hide: value => !value,
+          },
+          {
+            name: t('Load Balancer Class'),
+            value: item.spec.loadBalancerClass,
+            hide: _.isEmpty,
+          },
+          {
+            name: t('Load Balancer Source Ranges'),
+            value: item.spec.loadBalancerSourceRanges?.join(', '),
+            hide: _.isEmpty,
+          },
+          {
+            name: t('Traffic Distribution'),
+            value: item.spec.trafficDistribution,
             hide: _.isEmpty,
           },
           {
@@ -88,6 +152,20 @@ export default function ServiceDetails(props: {
         }
 
         return [
+          ...(item.spec.selector && Object.keys(item.spec.selector).length > 0
+            ? [
+                {
+                  id: 'headlamp.service-targeted-pods',
+                  section: (
+                    <TargetedPodsSection
+                      namespace={item.metadata.namespace}
+                      labelSelector={labelSelectorToQuery({ matchLabels: item.spec.selector })}
+                      cluster={item.cluster}
+                    />
+                  ),
+                },
+              ]
+            : []),
           {
             id: 'headlamp.service-ports',
             section: (
@@ -108,6 +186,23 @@ export default function ServiceDetails(props: {
                         </>
                       ),
                     },
+                    ...(item.spec.ports?.some(p => p.nodePort)
+                      ? [
+                          {
+                            label: t('Node Port'),
+                            getter: ({ nodePort }: KubeServicePort) =>
+                              nodePort ? <ValueLabel>{nodePort}</ValueLabel> : '-',
+                          },
+                        ]
+                      : []),
+                    ...(item.spec.ports?.some(p => p.appProtocol)
+                      ? [
+                          {
+                            label: t('App Protocol'),
+                            getter: ({ appProtocol }: KubeServicePort) => appProtocol ?? '-',
+                          },
+                        ]
+                      : []),
                   ]}
                   reflectInURL="ports"
                 />

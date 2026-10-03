@@ -15,6 +15,7 @@
  */
 
 import { InlineIcon } from '@iconify/react';
+import Alert from '@mui/material/Alert';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import Checkbox from '@mui/material/Checkbox';
@@ -30,9 +31,12 @@ import { useDropzone } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useHistory } from 'react-router-dom';
+import { encodeBase64 } from '../../helpers/base64';
 import { useClustersConf } from '../../lib/k8s';
 import { setCluster } from '../../lib/k8s/api/v1/clusterApi';
 import { setStatelessConfig } from '../../redux/configSlice';
+import store from '../../redux/stores/store';
+import { mergeStatelessConfigState } from '../../stateless';
 import { DialogTitle } from '../common/Dialog';
 import { DropZoneBox } from '../common/DropZoneBox';
 import Loader from '../common/Loader';
@@ -307,18 +311,9 @@ export function PureKubeConfigLoader(props: PureKubeConfigLoaderProps) {
     >
       <DialogTitle>{t('translation|Load from KubeConfig')}</DialogTitle>
       {error && error !== '' ? (
-        <Box
-          style={{
-            backgroundColor: '#f44336',
-            color: 'white',
-            textAlign: 'center',
-            padding: '12px',
-            marginBottom: '16px',
-            borderRadius: '4px',
-          }}
-        >
+        <Alert severity="error" sx={{ mb: 2 }}>
           {error}
-        </Box>
+        </Alert>
       ) : null}
       <Box>{renderSwitch()}</Box>
     </ClusterDialog>
@@ -371,15 +366,20 @@ function KubeConfigLoader() {
     if (state === Step.ConfigureClusters) {
       function loadClusters() {
         const selectedClusterConfig = configWithSelectedClusters(fileContent, selectedClusters);
-        setCluster({ kubeconfig: btoa(yaml.dump(selectedClusterConfig)) })
-          .then(res => {
-            if (res?.clusters?.length > 0) {
-              dispatch(setStatelessConfig(res));
+        setCluster({ kubeconfig: encodeBase64(yaml.dump(selectedClusterConfig)) })
+          .then(parsedConfig => {
+            if (parsedConfig?.clusters?.length > 0) {
+              const currentStatelessClusters = store.getState().config.statelessClusters;
+              dispatch(
+                setStatelessConfig(
+                  mergeStatelessConfigState(currentStatelessClusters, parsedConfig)
+                )
+              );
             }
             setState(Step.Success);
           })
           .catch(e => {
-            console.debug('Error setting up clusters from kubeconfig:', e);
+            console.error('Error setting up clusters from kubeconfig:', e);
             setError(
               t('translation|Error setting up clusters, please load a valid kubeconfig file')
             );

@@ -78,6 +78,48 @@ By default, headlamp leverages the `id_token` provided back from the OIDC Provid
 
 - `-oidc-use-access-token=true` or env var `HEADLAMP_CONFIG_OIDC_USE_ACCESS_TOKEN`
 
+### Multi-cluster: broadcast the OIDC token across sibling clusters
+
+When a single Headlamp instance serves several Kubernetes clusters that all trust the **same** OIDC application (same issuer URL and client ID), an operator can opt in to broadcasting the auth cookie to every matching sibling cluster after a successful login. This eliminates per-cluster re-authentication for the common deployment shape where one OIDC app (Okta, Keycloak, Dex, Entra ID, etc.) is registered with every `kube-apiserver` in the fleet.
+
+- `-oidc-use-token-broadcast=true` or env var `HEADLAMP_CONFIG_OIDC_USE_TOKEN_BROADCAST`
+
+**Precondition.** A sibling cluster receives the broadcast only when its kubeconfig context's OIDC auth-provider has BOTH a non-empty `idp-issuer-url` AND a non-empty `client-id` that match the source cluster's. Contexts using a different auth-provider (e.g. `gcp`, `azure`) or a static token are skipped silently.
+
+**Scope.** Broadcasting fires at initial OIDC login and again whenever a cluster's token is refreshed, so sibling clusters stay in sync with the session for its whole lifetime — including past short token expiries (commonly ~1h on EKS / Okta with default settings). Whichever token is in use is broadcast (the `id_token`, or the `access_token` when `-oidc-use-access-token=true`).
+
+**Caveats to be aware of before enabling.**
+
+- The flag is **disabled by default**; existing deployments see zero behavior change.
+- Audience mismatches are not detected here. A target apiserver's accepted audiences come from its OIDC client ID (`--oidc-client-id`) or the `audiences` list in a structured [AuthenticationConfiguration](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#using-authentication-configuration); if a target is configured to require a different or additional audience than the source, the broadcast cookie may be set but the target apiserver could reject the token. Align deployment configuration in that case.
+- When `-oidc-use-access-token=true`, the broadcast carries the `access_token` rather than the `id_token`. Unlike the `id_token`, an access token's audience is provider-specific and is frequently **not** the client ID (many IdPs — Okta, Entra ID, Auth0 — set it to a resource/API identifier). Matching issuer + client ID therefore does not by itself guarantee the access token is accepted by a sibling apiserver; ensure the access-token audience is honored fleet-wide before relying on broadcast with this flag.
+- Each target cluster receives one or more `Set-Cookie` headers per login, so enabling this with very large multi-cluster kubeconfigs may approach browser and proxy cookie count / size limits. The shared cookie mode below removes this.
+- Clusters added to the kubeconfig after the user logged in were not broadcast targets, so they hold no cookie and prompt for a login of their own. The shared cookie mode below removes this too.
+- Pre-existing chunk-cookie limitation: stale chunk cookies on cluster paths are not actively cleared during login because cookies live under `/clusters/<cluster>` while OIDC login completes on `/oidc-callback`. In the rare case a re-issued token uses fewer chunks than the previous one, the affected cluster(s) may need a one-time re-login.
+
+#### Shared cookie: store the token once for the whole fleet
+
+By default, broadcasting writes a full copy of the token into a cookie per cluster. With the shared cookie mode, the token is stored **once** instead and every cluster trusting the same OIDC identity reads that one copy.
+
+- `-oidc-shared-token-cookie=true` or env var `HEADLAMP_CONFIG_OIDC_SHARED_TOKEN_COOKIE`
+
+This requires `-oidc-use-token-broadcast=true` and is disabled by default.
+
+Two cookies are involved. The token lives in `headlamp-auth-fleet.<key>.<n>` at path `/clusters`, where `<key>` is derived from the OIDC issuer URL and client ID, so the browser sends it on requests for every cluster. Each cluster that matched the issuer + client-id check additionally gets `headlamp-auth-fleet.ref.<cluster>` at path `/clusters/<cluster>`, holding only `<key>`. A cluster reads the shared token only if it carries a ref cookie naming it, so a cluster trusting a different identity provider cannot use a token it was never entitled to, even though the browser sends it the cookie.
+
+What this changes in practice:
+
+- **One login, one refresh, fleet-wide.** The token is written once and refreshed in place, so clusters cannot drift onto different tokens.
+- **Clusters added after login are covered.** On first request to a new cluster, Headlamp compares that cluster's own kubeconfig issuer + client-id against the shared cookie and enrolls it if they match — the same check the login-time broadcast applies, moved to first contact.
+- **Cookie count and size stop scaling with fleet size.** One token cookie plus one small pointer per cluster, rather than a full token copy per cluster.
+- **Existing sessions keep working.** The per-cluster cookie is read first, so a session that predates the flag is unaffected until it next logs in.
+
+Caveats specific to this mode:
+
+- The audience caveats above apply unchanged; storing the token once does not make a target apiserver accept it.
+- The shared cookie is set at `/clusters` rather than `/`, so it is not attached to `/config` or static assets. It is still sent to every cluster path, which is what makes the ref cookie necessary.
+- The ref cookie's integrity rests on only Headlamp writing it (it is `HttpOnly`). An actor able to plant cookies in the user's browser could point a cluster at a shared token for an identity that cluster does not trust, causing Headlamp to forward that token to an API server that should not see it. Cookie-planting already allows overwriting the per-cluster auth cookies, so this is the same trust assumption Headlamp's existing cookie scheme makes; deployments that cannot rely on it should leave this flag off.
+
 ### Example: OIDC with Keycloak in Minikube
 
 If you are interested in a comprehensive example of using OIDC and Headlamp,
@@ -114,3 +156,11 @@ then you have to:
 - Set `-oidc-scopes` if needed, e.g. `-oidc-scopes=profile,email,groups`
 
 **Note** If you already have another static client configured for Kubernetes for the [apiserver's OIDC](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#configuring-the-api-server) (OpenID Connect) configuration, use a **single static client ID** i.e `-oidc-client-id` for both Dex and Headlamp. Additionally, the **redirectURIs** need to be specified for each client.
+
+### Troubleshooting: OIDC sign-in succeeds but the cluster rejects your token
+
+If you can sign in via OIDC but are returned to the "Sign in" screen with a message that the cluster rejected your token (and cannot load cluster resources), the cluster's **API server** is most likely not configured to trust the same OIDC provider as Headlamp. Headlamp only forwards the token to the API server, and the API server is what accepts or rejects it, so it must be OIDC-aware with a matching issuer, client ID, and audience.
+
+Make sure the API server is configured for the same OIDC provider (via its `--oidc-issuer-url` / `--oidc-client-id` flags or the equivalent [structured authentication configuration](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#configuring-the-api-server)), so that `--oidc-issuer-url` matches Headlamp's `-oidc-idp-issuer-url` and `--oidc-client-id` matches Headlamp's `-oidc-client-id`.
+
+Managed control planes (e.g. AKS, EKS, GKE) may not accept arbitrary OIDC flags on the API server. If that is the case, use the provider's managed identity/OIDC integration instead. When the API server rejects the token, Headlamp logs a warning containing `API server rejected the forwarded bearer token (401)`.

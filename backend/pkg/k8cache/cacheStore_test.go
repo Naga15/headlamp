@@ -103,6 +103,15 @@ func (m *MockCache) UpdateTTL(ctx context.Context, key string, ttl time.Duration
 	return nil
 }
 
+// SetOnEvicted Mocks setting a callback function to be called when an item is evicted.
+func (m *MockCache) SetOnEvicted(f func(key string, value string)) {
+}
+
+// Close mocks closing the cache.
+func (m *MockCache) Close() error {
+	return nil
+}
+
 // TestGetResponseBody checks that the response body is correctly decoded
 // based on the content encoding (e.g., gzip).
 func TestGetResponseBody(t *testing.T) {
@@ -189,6 +198,20 @@ func TestGetAPIGroup(t *testing.T) {
 			name:             "return empty apiGroup",
 			urlPath:          "/clusters/kind-kind/api/v1/pods",
 			expectedAPIGroup: "",
+			expectedVersion:  "v1",
+			expectedError:    nil,
+		},
+		{
+			name:             "return empty apiGroup from direct API path",
+			urlPath:          "/api/v1/pods",
+			expectedAPIGroup: "",
+			expectedVersion:  "v1",
+			expectedError:    nil,
+		},
+		{
+			name:             "return non-empty apiGroup from direct API path",
+			urlPath:          "/apis/apps/v1/deployments",
+			expectedAPIGroup: "apps",
 			expectedVersion:  "v1",
 			expectedError:    nil,
 		},
@@ -299,6 +322,12 @@ func TestExtractNamespace(t *testing.T) {
 			kind:       "services",
 		},
 		{
+			name:       "valid namespaced resource with multiple trailing slashes",
+			urlPath:    url.URL{Path: "/api/v1/namespaces/dev/services//"},
+			namespaces: "dev",
+			kind:       "services",
+		},
+		{
 			name:       "internal cluster URL without API group",
 			urlPath:    url.URL{Path: "/clusters/production-cluster"},
 			namespaces: "",
@@ -326,6 +355,66 @@ func TestExtractNamespace(t *testing.T) {
 	}
 }
 
+func TestIsKubernetesAPIPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{
+			name:     "proxied core resource path",
+			path:     "/clusters/kind-kind/api/v1/pods",
+			expected: true,
+		},
+		{
+			name:     "proxied named resource path",
+			path:     "/clusters/kind-kind/apis/apps/v1/deployments",
+			expected: true,
+		},
+		{
+			name:     "direct core resource path",
+			path:     "/api/v1/pods",
+			expected: true,
+		},
+		{
+			name:     "direct named resource path",
+			path:     "/apis/apps/v1/deployments",
+			expected: true,
+		},
+		{
+			name:     "direct core api root",
+			path:     "/api",
+			expected: true,
+		},
+		{
+			name:     "proxied named api root with trailing slash",
+			path:     "/clusters/kind-kind/apis/",
+			expected: true,
+		},
+		{
+			name:     "proxied discovery path",
+			path:     "/clusters/kind-kind/api/",
+			expected: true,
+		},
+		{
+			name:     "proxied healthz path",
+			path:     "/clusters/kind-kind/healthz",
+			expected: false,
+		},
+		{
+			name:     "proxied version path",
+			path:     "/clusters/kind-kind/version",
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, k8cache.IsKubernetesAPIPath(tc.path))
+		})
+	}
+}
+
 // TestGenerateKey ensures the generated key is valid for both normal
 // and empty cluster name scenarios.
 //
@@ -348,6 +437,13 @@ func TestGenerateKey(t *testing.T) {
 		{
 			name:        "key with empty apiGroup",
 			urlPath:     url.URL{Path: "/clusters/kind-kind/api/v1/namespaces/test-kube/pods"},
+			contextKey:  "kind-kind",
+			expectedKey: "+pods+test-kube+kind-kind",
+			expectedErr: nil,
+		},
+		{
+			name:        "key with direct api path",
+			urlPath:     url.URL{Path: "/api/v1/namespaces/test-kube/pods"},
 			contextKey:  "kind-kind",
 			expectedKey: "+pods+test-kube+kind-kind",
 			expectedErr: nil,
@@ -400,6 +496,23 @@ func TestGenerateKey(t *testing.T) {
 			contextKey:  "kind-kind",
 			expectedKey: "",
 			expectedErr: errors.New("invalid url format"),
+		},
+		{
+			name:        "context key containing a literal plus is escaped, not treated as delimiter",
+			urlPath:     url.URL{Path: "/clusters/kind-kind/apis/apps/v1/namespaces/default/deployments"},
+			contextKey:  "prod+cluster",
+			expectedKey: "apps+deployments+default+prod%2Bcluster",
+			expectedErr: nil,
+		},
+		{
+			// Regression: ensures the escape is injective. If "%" weren't
+			// escaped first, this input would collide with "prod+cluster"
+			// above and both would produce the same cache key.
+			name:        "context key containing a literal percent sequence does not collide with the plus-escaped form",
+			urlPath:     url.URL{Path: "/clusters/kind-kind/apis/apps/v1/namespaces/default/deployments"},
+			contextKey:  "prod%2Bcluster",
+			expectedKey: "apps+deployments+default+prod%252Bcluster",
+			expectedErr: nil,
 		},
 	}
 	for _, tc := range tests {
@@ -549,9 +662,8 @@ func TestStoreK8sResponseInCache(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rw := httptest.NewRecorder()
 			rcw := k8cache.NewResponseCapture(rw)
-			r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.urlObj.Path, nil)
 			newCache := NewMockCache()
-			err := k8cache.StoreK8sResponseInCache(newCache, tc.urlObj, rcw, r, tc.key)
+			err := k8cache.StoreK8sResponseInCache(newCache, tc.urlObj, rcw, tc.key)
 			assert.NoError(t, err)
 		})
 	}
@@ -752,11 +864,7 @@ func TestStoreK8sResponseInCache_SkipSelfSubjectRulesReview(t *testing.T) {
 	rw := httptest.NewRecorder()
 	rcw := k8cache.NewResponseCapture(rw)
 
-	r := httptest.NewRequestWithContext(
-		context.Background(), http.MethodGet, targetURL.Path, nil,
-	)
-
-	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, r, "skip-key")
+	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, "skip-key")
 	assert.NoError(t, err)
 
 	// Key must NOT have been written to the cache.
@@ -784,11 +892,7 @@ func TestStoreK8sResponseInCache_GzipBody(t *testing.T) {
 	rcw.WriteHeader(http.StatusOK)
 	_, _ = rcw.Write(buf.Bytes())
 
-	r := httptest.NewRequestWithContext(
-		context.Background(), http.MethodGet, targetURL.Path, nil,
-	)
-
-	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, r, "gzip-key")
+	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, "gzip-key")
 	assert.NoError(t, err)
 
 	// The stored value must exist and must NOT contain the Content-Encoding header.
@@ -813,11 +917,7 @@ func TestStoreK8sResponseInCache_FailureBodyNotCached(t *testing.T) {
 	rcw.WriteHeader(http.StatusForbidden)
 	_, _ = rcw.Write([]byte(failureBody))
 
-	r := httptest.NewRequestWithContext(
-		context.Background(), http.MethodGet, targetURL.Path, nil,
-	)
-
-	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, r, "failure-key")
+	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, "failure-key")
 	assert.NoError(t, err)
 
 	// Key must NOT have been written to the cache.
@@ -867,14 +967,82 @@ func TestStoreK8sResponseInCache_5xxResponseShouldNotBeCached(t *testing.T) {
 	rcw.WriteHeader(http.StatusBadGateway)
 	_, _ = rcw.Write([]byte(`<html><body>Bad Gateway</body></html>`))
 
-	r := httptest.NewRequestWithContext(
-		context.Background(), http.MethodGet, targetURL.Path, nil,
-	)
-
-	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, r, "infra-error-key")
+	err := k8cache.StoreK8sResponseInCache(mockCache, targetURL, rcw, "infra-error-key")
 	assert.NoError(t, err)
 
 	// Key must NOT be in cache — infrastructure errors should not be cached
 	_, getErr := mockCache.Get(context.Background(), "infra-error-key")
 	assert.Error(t, getErr, "5xx infrastructure errors should not be cached")
+}
+
+func TestRedactContextKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty context key",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "very short context key",
+			input:    "dev",
+			expected: "[redacted]",
+		},
+		{
+			name:     "medium context key",
+			input:    "prod",
+			expected: "pro...[redacted]",
+		},
+		{
+			name:     "long context key",
+			input:    "my-production-cluster",
+			expected: "my-...[redacted]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := k8cache.ExportedRedactContextKey(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestRedactCacheKey(t *testing.T) {
+	cacheTests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "invalid cache key with fewer segments",
+			input:    "api+pods+default",
+			expected: "api+pods+default",
+		},
+		{
+			name:     "valid cache key with 4 segments and short context",
+			input:    "api+pods+default+dev",
+			expected: "api+pods+default+[redacted]",
+		},
+		{
+			name:     "valid cache key with 4 segments and medium context",
+			input:    "api+pods+default+prod",
+			expected: "api+pods+default+pro...[redacted]",
+		},
+		{
+			name:     "valid cache key with 4 segments and long context",
+			input:    "api+pods+default+my-production-cluster",
+			expected: "api+pods+default+my-...[redacted]",
+		},
+	}
+
+	for _, tc := range cacheTests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := k8cache.ExportedRedactCacheKey(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
 }

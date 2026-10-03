@@ -24,6 +24,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cli/browser"
@@ -49,13 +50,14 @@ func main() {
 		return
 	}
 
-	conf, err := config.Parse(os.Args)
+	conf, err := config.ParseWithAppNameDefault(os.Args, kubeconfig.AppName)
 	if err != nil {
 		logger.Log(logger.LevelError, nil, err, "fetching config:%v")
 		os.Exit(1)
 	}
 
 	logger.Init(conf.LogLevel)
+	kubeconfig.AppName = conf.AppName
 
 	if conf.Version {
 		fmt.Printf("%s %s (%s/%s)\n", kubeconfig.AppName, kubeconfig.Version, runtime.GOOS, runtime.GOARCH)
@@ -80,9 +82,11 @@ func main() {
 // buildHeadlampCFG maps the parsed config into the struct the backend uses.
 func buildHeadlampCFG(conf *config.Config, kubeConfigStore kubeconfig.ContextStore) *headlampconfig.HeadlampCFG {
 	return &headlampconfig.HeadlampCFG{
+		AppName:                conf.AppName,
 		UseInCluster:           conf.InCluster,
 		InClusterContextName:   conf.InClusterContextName,
 		KubeConfigPath:         conf.KubeConfigPath,
+		KubeConfigDir:          conf.KubeConfigDir,
 		SkippedKubeContexts:    conf.SkippedKubeContexts,
 		ListenAddr:             conf.ListenAddr,
 		CacheEnabled:           conf.CacheEnabled,
@@ -108,13 +112,18 @@ func buildHeadlampCFG(conf *config.Config, kubeConfigStore kubeconfig.ContextSto
 		}(),
 		ClusterInventoryProviderFile:          conf.ClusterInventoryProviderFile,
 		ClusterInventoryLabelSelector:         conf.ClusterInventoryLabelSelector,
+		ClusterInventoryNamespaces:            conf.ClusterInventoryNamespaces,
 		ClusterInventoryRootReconcileInterval: conf.ClusterInventoryRootReconcileInterval,
 		ClusterInventoryNoCRDCacheTTL:         conf.ClusterInventoryNoCRDCacheTTL,
 		TLSCertPath:                           conf.TLSCertPath,
 		TLSKeyPath:                            conf.TLSKeyPath,
 		SessionTTL:                            conf.SessionTTL,
 		PodDebugImage:                         conf.PodDebugImage,
+		NodeShellImage:                        conf.NodeShellImage,
+		NodeShellNamespace:                    conf.NodeShellNamespace,
 		OidcUseCookie:                         conf.OidcUseCookie,
+		OidcUseTokenBroadcast:                 conf.OidcUseTokenBroadcast,
+		OidcSharedTokenCookie:                 conf.OidcSharedTokenCookie,
 		DefaultLightTheme:                     conf.DefaultLightTheme,
 		DefaultDarkTheme:                      conf.DefaultDarkTheme,
 		ForceTheme:                            conf.ForceTheme,
@@ -138,9 +147,65 @@ func buildTelemetryConfig(conf *config.Config) config.Config {
 	}
 }
 
+// setupKubeConfigStoreWatcher sets up a listener on the kubeConfigStore to sync watchers
+// when kubeconfig contexts change.
+func setupKubeConfigStoreWatcher(kubeConfigStore kubeconfig.ContextStore) {
+	var (
+		syncTimer  *time.Timer
+		syncMu     sync.Mutex
+		generation int64
+	)
+
+	kubeConfigStore.AddListener(func() {
+		syncMu.Lock()
+		defer syncMu.Unlock()
+
+		generation++
+		currentGen := generation
+
+		if syncTimer != nil {
+			syncTimer.Stop()
+		}
+
+		syncTimer = time.AfterFunc(500*time.Millisecond, func() {
+			syncMu.Lock()
+			if currentGen != generation {
+				syncMu.Unlock()
+				return
+			}
+			syncMu.Unlock()
+
+			active, err := kubeConfigStore.GetContextKeys()
+			if err != nil {
+				logger.Log(logger.LevelWarn, nil, err, "failed to get kubeconfig context keys; skipping watcher sync")
+				return
+			}
+
+			k8cache.SyncWatchers(k8sResponseCache, active)
+		})
+	})
+}
+
+// loadOidcCACert reads the OIDC CA certificate from file if configured.
+func loadOidcCACert(oidcCAFile string) string {
+	if oidcCAFile == "" {
+		return ""
+	}
+
+	caFileContents, err := os.ReadFile(oidcCAFile) //nolint:gosec
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "reading oidc ca file")
+		os.Exit(1)
+	}
+
+	return string(caFileContents)
+}
+
 func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 	cache := cache.New[interface{}]()
 	kubeConfigStore := kubeconfig.NewContextStore()
+	setupKubeConfigStoreWatcher(kubeConfigStore)
+
 	multiplexer := NewMultiplexer(kubeConfigStore, conf.InCluster && conf.UnsafeUseServiceAccountToken)
 
 	cfg := &headlampconfig.HeadlampConfig{
@@ -162,16 +227,7 @@ func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 		Cache:                     cache,
 		Multiplexer:               multiplexer,
 		TelemetryConfig:           buildTelemetryConfig(conf),
-	}
-
-	if conf.OidcCAFile != "" {
-		caFileContents, err := os.ReadFile(conf.OidcCAFile) //nolint:gosec
-		if err != nil {
-			logger.Log(logger.LevelError, nil, err, "reading oidc ca file")
-			os.Exit(1)
-		}
-
-		cfg.OidcCACert = string(caFileContents)
+		OidcCACert:                loadOidcCACert(conf.OidcCAFile),
 	}
 
 	cfg.ProxyAuthEnabled = conf.ProxyAuthEnabled
@@ -209,7 +265,7 @@ func GetContextKeyAndKContext(w http.ResponseWriter,
 		return nil, nil, "", nil, err
 	}
 
-	kContext, err := c.KubeConfigStore.GetContext(contextKey)
+	contextKey, kContext, err := c.getContextWithWebSocketFallback(r, contextKey)
 	if err != nil {
 		c.handleError(w, ctx, span, err, "failed to get context", http.StatusNotFound)
 		return nil, nil, "", nil, err
@@ -234,6 +290,11 @@ func CacheMiddleWare(c *HeadlampConfig) mux.MiddlewareFunc {
 
 func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.ResponseWriter, r *http.Request) {
 	if k8cache.SkipWebSocket(r, next, w) {
+		return
+	}
+
+	if !k8cache.IsKubernetesAPIPath(r.URL.Path) || k8cache.IsSelfSubjectReviewAPIPath(r.URL.Path) {
+		next.ServeHTTP(w, r)
 		return
 	}
 
@@ -270,7 +331,7 @@ func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.Respons
 
 	next.ServeHTTP(rcw, r)
 
-	if err := k8cache.StoreK8sResponseInCache(k8sResponseCache, r.URL, rcw, r, key); err != nil {
+	if err := k8cache.StoreK8sResponseInCache(k8sResponseCache, r.URL, rcw, key); err != nil {
 		// Response was already written to client via rcw; just log the cache storage error
 		logger.Log(logger.LevelError, nil, err, "failed to store response in cache")
 	}
@@ -292,7 +353,7 @@ func handleCacheAuthorization(
 		clearRequestAuthorization(r)
 	}
 
-	isAllowed, authErr := k8cache.IsAllowed(kContext, r)
+	isAllowed, authErr := k8cache.IsAllowed(contextKey, kContext, r)
 	if authErr != nil {
 		k8cache.ServeFromCacheOrForwardToK8s(k8sResponseCache, isAllowed, next, key, w, r, rcw)
 

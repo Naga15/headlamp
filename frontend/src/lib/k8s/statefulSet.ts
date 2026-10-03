@@ -27,6 +27,8 @@ import type { RevisionInfo, RollbackOptions, RollbackResult } from './rollback';
 export interface KubeStatefulSet extends KubeObjectInterface {
   spec: {
     selector: LabelSelector;
+    serviceName?: string;
+    podManagementPolicy?: 'OrderedReady' | 'Parallel';
     updateStrategy: {
       rollingUpdate: {
         partition: number;
@@ -120,7 +122,7 @@ class StatefulSet extends KubeObject<KubeStatefulSet> {
           namespace: this.getNamespace(),
           cluster: this.cluster,
           queryParams: {
-            labelSelector: this.spec.selector.matchLabels
+            labelSelector: this.spec?.selector?.matchLabels
               ? Object.entries(this.spec.selector.matchLabels)
                   .map(([k, v]) => `${k}=${v}`)
                   .join(',')
